@@ -1,0 +1,138 @@
+name: NEARUSDT Telegram Alerts
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check NEARUSDT and send Telegram alert
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+          CHAT_ID = os.environ.get("CHAT_ID", "")
+          if not BOT_TOKEN or not CHAT_ID:
+              raise RuntimeError("Добавь GitHub Secrets BOT_TOKEN и CHAT_ID")
+
+          def get_json(url):
+              request = urllib.request.Request(
+                  url,
+                  headers={"Accept": "application/json", "User-Agent": "Mozilla/5.0"},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      return json.loads(response.read().decode())
+              except urllib.error.HTTPError as error:
+                  details = error.read().decode(errors="replace")[:300]
+                  raise RuntimeError(f"HTTP {error.code}: {details}") from error
+
+          def get_candles():
+              # Сначала Bybit. Если GitHub runner получает 403, пробуем Binance Futures.
+              bybit_url = (
+                  "https://api.bybit.com/v5/market/kline"
+                  "?category=linear&symbol=NEARUSDT&interval=15&limit=100"
+              )
+              try:
+                  data = get_json(bybit_url)
+                  if data.get("retCode") == 0:
+                      rows = data["result"]["list"]
+                      candles = sorted(rows, key=lambda c: int(c[0]))
+                      return candles, "Bybit"
+                  raise RuntimeError(str(data.get("retMsg")))
+              except Exception as error:
+                  print(f"Bybit недоступен ({error}); пробую Binance Futures.")
+                  binance_url = (
+                      "https://fapi.binance.com/fapi/v1/klines"
+                      "?symbol=NEARUSDT&interval=15m&limit=100"
+                  )
+                  rows = get_json(binance_url)
+                  # Binance kline: open time, open, high, low, close, ...
+                  candles = [
+                      [str(row[0]), str(row[1]), str(row[2]), str(row[3]), str(row[4])]
+                      for row in rows
+                  ]
+                  return candles, "Binance Futures (резервный источник)"
+
+          def ema(values, period):
+              multiplier = 2 / (period + 1)
+              result = values[0]
+              for value in values[1:]:
+                  result = value * multiplier + result * (1 - multiplier)
+              return result
+
+          def rsi(values, period=14):
+              changes = [values[i] - values[i - 1] for i in range(1, len(values))]
+              recent = changes[-period:]
+              gains = sum(max(x, 0) for x in recent) / period
+              losses = sum(max(-x, 0) for x in recent) / period
+              if losses == 0:
+                  return 100.0
+              return 100 - 100 / (1 + gains / losses)
+
+          def send_telegram_message(message):
+              url = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage"
+              body = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": message}).encode()
+              request = urllib.request.Request(url, data=body)
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  result = json.loads(response.read().decode())
+              if not result.get("ok"):
+                  raise RuntimeError("Telegram не принял сообщение")
+              print("Сообщение отправлено в Telegram.")
+
+          candles, source = get_candles()
+          now_ms = int(time.time() * 1000)
+          candles = [c for c in candles if int(c[0]) + 15 * 60 * 1000 <= now_ms]
+          if len(candles) < 60:
+              raise RuntimeError("Недостаточно закрытых свечей")
+
+          closes = [float(c[4]) for c in candles]
+          highs = [float(c[2]) for c in candles]
+          lows = [float(c[3]) for c in candles]
+          last = closes[-1]
+          ema20 = ema(closes[-80:], 20)
+          ema50 = ema(closes[-80:], 50)
+          rsi_value = rsi(closes)
+          recent_high = max(highs[-21:-1])
+          recent_low = min(lows[-21:-1])
+
+          signal = None
+          if last > ema20 > ema50 and 52 <= rsi_value <= 68 and last > recent_high:
+              signal = "LONG"
+          elif last < ema20 < ema50 and 32 <= rsi_value <= 48 and last < recent_low:
+              signal = "SHORT"
+
+          print(
+              f"Источник={source}; цена={last:.4f}; RSI={rsi_value:.1f}; "
+              f"EMA20={ema20:.4f}; EMA50={ema50:.4f}; сигнал={signal or 'нет'}"
+          )
+
+          if signal:
+              message = (
+                  f"NEARUSDT {signal} — сигнал для проверки\n"
+                  f"Источник данных: {source}\n"
+                  f"Цена: {last:.4f}\n"
+                  f"RSI(14): {rsi_value:.1f}\n"
+                  f"EMA20: {ema20:.4f}\n"
+                  f"EMA50: {ema50:.4f}\n"
+                  f"Максимум/минимум предыдущих 20 свечей: {recent_high:.4f} / {recent_low:.4f}\n"
+                  "Это уведомление, не автоматический вход и не гарантия прибыли. "
+                  "Проверь график Bybit, стоп и комиссии перед сделкой."
+              )
+              send_telegram_message(message)
+          PY
